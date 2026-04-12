@@ -18,7 +18,7 @@ This project solves that by using a multi-agent AI system to process and interpr
 
 ## Solution
 
-We built a **4-agent AI system** where:
+I built a **4-agent AI system** where:
 - **Agent 1: Clinical Analyzer** - Extracts symptoms, conditions, and severity
 - **Agent 2: Risk Detector** - Identifies critical findings and abnormalities
 - **Agent 3: Drug Interaction Checker** - Validates medication safety
@@ -169,71 +169,6 @@ python scripts/benchmark.py
 
 # Generate metrics
 python scripts/metrics_report.py
-```
-
----
-
-## Example: Input & Output
-
-### Input
-```json
-{
-  "patient_id": "P001",
-  "note_text": "Patient: John Doe, 58M. Chief Complaint: Chest pain and shortness of breath. HPI: 2 days of intermittent chest pain, worse with exertion. PMH: Hypertension (10 years), Type 2 DM (5 years). Vital Signs: BP 160/100, HR 105, RR 22, O2 Sat 94%.",
-  "medications": ["Lisinopril 10mg", "Metformin 1000mg", "Aspirin 81mg"]
-}
-```
-
-### Output
-```json
-{
-  "success": true,
-  "data": {
-    "patient_id": "P001",
-    
-    "workflow_stage_1_analysis": {
-      "raw": "- Chief Complaint: Chest pain and dyspnea\n- Conditions: Hypertension, Type 2 Diabetes\n- Severity: High"
-    },
-    
-    "workflow_stage_2_risks": {
-      "raw": "CRITICAL FLAGS:\n- Elevated BP: 160/100 mmHg\n- Low O2: 94%\n- Urgency Level: HIGH",
-      "risk_level": "HIGH"
-    },
-    
-    "workflow_stage_3_interactions": {
-      "raw": "- No major interactions detected\n- Status: Safe"
-    },
-    
-    "workflow_stage_4_recommendations": {
-      "raw": "- Suggested tests: ECG, Troponin, Chest X-ray\n- Recommended treatments: Aspirin, Beta-blocker, Nitrates\n- Monitoring: Continuous cardiac monitoring"
-    },
-    
-    "tools_invoked": 12,
-    
-    "execution_log": [
-      {
-        "agent": "clinical_analyzer",
-        "tools_called": ["extract_symptoms", "identify_conditions", "classify_severity"],
-        "confidence": 0.87
-      },
-      {
-        "agent": "risk_detector",
-        "tools_called": ["detect_critical_values", "flag_abnormalities", "assess_urgency"],
-        "confidence": 0.87
-      },
-      {
-        "agent": "drug_interaction",
-        "tools_called": ["check_interactions", "check_contraindications", "verify_dosage"],
-        "confidence": 0.87
-      },
-      {
-        "agent": "recommendation",
-        "tools_called": ["suggest_tests", "suggest_treatments", "predict_outcomes"],
-        "confidence": 0.87
-      }
-    ]
-  }
-}
 ```
 
 ---
