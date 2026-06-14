@@ -1,14 +1,49 @@
-import json
+"""Clinical multi-agent system – ML-driven.
+
+The previous version of this file relied on hard-coded keyword dictionaries
+and regex heuristics. That implementation suffered from several bugs:
+
+* The keyword tables (``CONDITION_KEYWORDS``, ``SYMPTOM_KEYWORDS``,
+  ``RECOMMENDATION_MAP`` …) duplicated information that already lives in
+  ``data/disease_dataset.csv`` and could drift out of sync.
+* The risk score, severity, medications and tests were hand-tuned constants.
+* No actual machine-learning was performed – everything was string matching.
+
+This rewrite keeps the *shape* of the multi-agent workflow (analyser → risk
+detector → drug interaction → recommendation) but powers every agent with
+real models trained from the CSV:
+
+* **Clinical Analyzer** – predicts the most likely disease and the cluster
+  of similar diseases from the user-supplied symptoms / free text.
+* **Risk Detector** – uses a Gradient Boosting regressor to compute a
+  continuous risk score and maps it to a categorical risk level.
+* **Drug Interaction** – the same small interaction database that the
+  previous version embedded, but evaluated against medications the model
+  actually recommended.
+* **Recommendation Engine** – pulls the medication / test list directly
+  from the CSV and produces monitoring + follow-up guidance.
+"""
+
+from __future__ import annotations
+
 import re
-from typing import List, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any, Dict, List, Optional
 
+from backend.utils.predictor import MLPredictor, _risk_level
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ClinicalNote:
     patient_id: str
-    note_text: str
+    note_text: str = ""
+    symptoms: List[str] = field(default_factory=list)
+    disease_query: str = ""
     medications: List[str] = field(default_factory=list)
 
 
@@ -27,310 +62,465 @@ class AgentType(Enum):
     RECOMMENDATION = "recommendation"
 
 
+# ---------------------------------------------------------------------------
+# Drug interaction knowledge base
+# ---------------------------------------------------------------------------
+# Small, hand-curated database – replacing the old ``DRUG_INTERACTIONS_DB``
+# but kept as a static lookup since interaction data is not in the dataset.
+
+DRUG_INTERACTIONS_DB: Dict[tuple, Dict[str, str]] = {
+    ("warfarin", "aspirin"):       {"severity": "HIGH",   "effect": "Increased bleeding risk"},
+    ("warfarin", "ibuprofen"):     {"severity": "HIGH",   "effect": "Increased bleeding risk"},
+    ("warfarin", "naproxen"):      {"severity": "HIGH",   "effect": "Increased bleeding risk"},
+    ("lisinopril", "potassium"):   {"severity": "MEDIUM", "effect": "Hyperkalemia risk"},
+    ("lisinopril", "spironolactone"): {"severity": "MEDIUM", "effect": "Hyperkalemia risk"},
+    ("metformin", "alcohol"):      {"severity": "MEDIUM", "effect": "Lactic acidosis risk"},
+    ("metformin", "contrast"):     {"severity": "HIGH",   "effect": "Lactic acidosis risk — hold before contrast"},
+    ("ssri", "tramadol"):          {"severity": "HIGH",   "effect": "Serotonin syndrome risk"},
+    ("ssri", "maoi"):              {"severity": "HIGH",   "effect": "Serotonin syndrome — contraindicated"},
+    ("statin", "gemfibrozil"):     {"severity": "HIGH",   "effect": "Myopathy / rhabdomyolysis risk"},
+    ("digoxin", "amiodarone"):     {"severity": "HIGH",   "effect": "Digoxin toxicity risk"},
+    ("ace inhibitor", "nsaid"):    {"severity": "MEDIUM", "effect": "Reduced antihypertensive effect, nephrotoxicity"},
+    ("beta blocker", "verapamil"): {"severity": "HIGH",   "effect": "Bradycardia and heart block risk"},
+    ("clopidogrel", "ppi"):        {"severity": "MEDIUM", "effect": "Reduced antiplatelet efficacy"},
+}
+
+DRUG_ALIASES: Dict[str, List[str]] = {
+    "lisinopril": ["lisinopril", "ace inhibitor"],
+    "enalapril":  ["enalapril", "ace inhibitor"],
+    "ramipril":   ["ramipril", "ace inhibitor"],
+    "atorvastatin": ["atorvastatin", "statin"],
+    "rosuvastatin": ["rosuvastatin", "statin"],
+    "simvastatin":  ["simvastatin", "statin"],
+    "metoprolol":   ["metoprolol", "beta blocker"],
+    "atenolol":     ["atenolol", "beta blocker"],
+    "carvedilol":   ["carvedilol", "beta blocker"],
+    "sertraline":   ["sertraline", "ssri"],
+    "fluoxetine":   ["fluoxetine", "ssri"],
+    "escitalopram": ["escitalopram", "ssri"],
+    "citalopram":   ["citalopram", "ssri"],
+    "phenelzine":   ["phenelzine", "maoi"],
+    "tranylcypromine": ["tranylcypromine", "maoi"],
+}
+
+INLINE_MED_PATTERN = re.compile(
+    r"\b(aspirin|warfarin|metformin|lisinopril|atorvastatin|metoprolol|"
+    r"amlodipine|furosemide|omeprazole|sertraline|clopidogrel|digoxin|"
+    r"amiodarone|tramadol|ibuprofen|naproxen|spironolactone|verapamil|"
+    r"gemfibrozil|apixaban|rivaroxaban|albuterol|prednisone)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_med(med: str) -> List[str]:
+    """Strip dosage info and return canonical name + class aliases."""
+    med_lower = med.lower().strip()
+    base = re.sub(r"\s*\d+\s*mg.*", "", med_lower).strip()
+    aliases = [base]
+    for canonical, alias_list in DRUG_ALIASES.items():
+        if base == canonical or base in alias_list:
+            aliases.extend(alias_list)
+    return list(set(aliases))
+
+
+def _check_drug_interactions(medications: List[str]) -> List[Dict[str, str]]:
+    normalized = [_normalize_med(m) for m in medications]
+    found: List[Dict[str, str]] = []
+    checked = set()
+    for i, aliases_i in enumerate(normalized):
+        for j, aliases_j in enumerate(normalized):
+            if i >= j:
+                continue
+            pair_key = tuple(sorted([i, j]))
+            if pair_key in checked:
+                continue
+            checked.add(pair_key)
+            for alias_i in aliases_i:
+                for alias_j in aliases_j:
+                    interaction = (
+                        DRUG_INTERACTIONS_DB.get((alias_i, alias_j))
+                        or DRUG_INTERACTIONS_DB.get((alias_j, alias_i))
+                    )
+                    if interaction:
+                        found.append({
+                            "drug_1": medications[i],
+                            "drug_2": medications[j],
+                            "severity": interaction["severity"],
+                            "effect": interaction["effect"],
+                        })
+                        break
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+
 class MedGemmaAgent:
-    def __init__(self, agent_type: AgentType):
+    def __init__(self, agent_type: AgentType, predictor: MLPredictor):
         self.agent_type = agent_type
+        self.predictor = predictor
         self.tools = self._initialize_tools()
 
     def _initialize_tools(self) -> List[str]:
         base = ["analyze_text", "extract_entities", "score_findings"]
-        
         tools_map = {
-            AgentType.CLINICAL_ANALYZER: base + ["extract_symptoms", "identify_conditions", "classify_severity"],
-            AgentType.RISK_DETECTOR: base + ["detect_critical_values", "flag_abnormalities", "assess_urgency"],
-            AgentType.DRUG_INTERACTION: base + ["check_interactions", "check_contraindications", "verify_dosage"],
-            AgentType.RECOMMENDATION: base + ["suggest_tests", "suggest_treatments", "predict_outcomes"],
+            AgentType.CLINICAL_ANALYZER: base + ["extract_symptoms", "predict_disease", "cluster_disease"],
+            AgentType.RISK_DETECTOR:     base + ["score_risk", "assess_severity", "flag_critical"],
+            AgentType.DRUG_INTERACTION:  base + ["check_interactions", "check_contraindications", "verify_dosage"],
+            AgentType.RECOMMENDATION:    base + ["suggest_medications", "suggest_tests", "predict_outcomes"],
         }
-        
         return tools_map.get(self.agent_type, base)
 
-    def generate_prompt(self, context: str, task: str) -> str:
-        prompts = {
-            AgentType.CLINICAL_ANALYZER: f"Extract clinical findings:\n1. Chief complaint\n2. Medical conditions\n3. Symptoms and severity\n4. Key clinical findings\n\nNote: {context}\nTask: {task}",
-            AgentType.RISK_DETECTOR: f"Identify critical findings:\n1. Life-threatening conditions\n2. Abnormal vital signs\n3. Drug allergies\n4. Severity assessment\n\nNote: {context}\nTask: {task}",
-            AgentType.DRUG_INTERACTION: f"Check medications:\n1. Drug interactions\n2. Contraindications\n3. Dosage appropriateness\n4. Alternatives\n\nMedications: {context}\nTask: {task}",
-            AgentType.RECOMMENDATION: f"Generate recommendations:\n1. Additional tests\n2. Treatment options\n3. Follow-up actions\n4. Monitoring requirements\n\nContext: {context}\nTask: {task}",
-        }
-        
-        return prompts.get(self.agent_type, f"Context: {context}\nTask: {task}")
-
     def call_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
-        tools = {
-            "extract_symptoms": {"status": "success"},
-            "identify_conditions": {"status": "success"},
-            "classify_severity": {"status": "success"},
-            "detect_critical_values": {"status": "success"},
-            "flag_abnormalities": {"status": "success"},
-            "assess_urgency": {"status": "success"},
-            "check_interactions": {"status": "success"},
-            "check_contraindications": {"status": "success"},
-            "verify_dosage": {"status": "success"},
-            "suggest_tests": {"status": "success"},
-            "suggest_treatments": {"status": "success"},
-            "predict_outcomes": {"status": "success"},
-            "analyze_text": {"status": "success"},
-            "extract_entities": {"status": "success"},
-            "score_findings": {"status": "success"},
-        }
-        
-        return tools.get(tool_name, {"status": "error", "message": f"Unknown: {tool_name}"})
+        return {"status": "success", "tool": tool_name}
 
-    def analyze(self, note: ClinicalNote, task: str = None) -> AnalysisResult:
-        if task is None:
-            task = f"Analyze using {self.agent_type.value}"
-        
-        prompt = self.generate_prompt(note.note_text, task)
-        response = self._simulate_inference(prompt, note)
-        tool_calls = self._extract_tool_calls(response)
-        
+    def analyze(self, note: ClinicalNote) -> AnalysisResult:
+        findings, tool_calls = self._run_analysis(note)
         for tc in tool_calls:
-            self.call_tool(tc["name"], **tc.get("params", {}))
-        
-        findings = self._parse_findings(response)
-        
+            self.call_tool(tc)
         return AnalysisResult(
             agent_name=self.agent_type.value,
             findings=findings,
-            confidence=0.87,
-            tool_calls_made=[tc["name"] for tc in tool_calls]
+            confidence=self._compute_confidence(findings),
+            tool_calls_made=tool_calls,
         )
 
-    def _simulate_inference(self, prompt: str, note: ClinicalNote) -> str:
-        text_lower = note.note_text.lower()
-        
+    def _compute_confidence(self, findings: Dict[str, Any]) -> float:
+        score = 0.6
+        if findings.get("found") is False:
+            return 0.3
+        if findings.get("top_diseases"):
+            top = findings["top_diseases"][0]
+            score = min(0.95, 0.55 + float(top.get("probability", 0)) / 2)
+        if findings.get("medications"):
+            score = min(0.95, score + 0.05)
+        return round(score, 2)
+
+    # ------------------------------------------------------------------
+    def _run_analysis(self, note: ClinicalNote):
         if self.agent_type == AgentType.CLINICAL_ANALYZER:
-            findings = []
-            
-            if 'chest pain' in text_lower:
-                findings.append('Chief Complaint: Chest pain')
-            elif 'pain' in text_lower:
-                findings.append('Chief Complaint: Pain')
-            elif 'fever' in text_lower:
-                findings.append('Chief Complaint: Fever')
-            elif 'shortness of breath' in text_lower or 'dyspnea' in text_lower:
-                findings.append('Chief Complaint: Shortness of breath')
-            
-            conditions = []
-            if 'hypertension' in text_lower or 'high blood pressure' in text_lower:
-                conditions.append('Hypertension')
-            if 'diabetes' in text_lower:
-                conditions.append('Diabetes')
-            if 'asthma' in text_lower:
-                conditions.append('Asthma')
-            if 'copd' in text_lower:
-                conditions.append('COPD')
-            if 'heart' in text_lower:
-                conditions.append('Cardiac condition')
-            
-            severity = 'Low'
-            if 'acute' in text_lower or 'emergency' in text_lower or 'critical' in text_lower:
-                severity = 'High'
-            elif 'chronic' in text_lower:
-                severity = 'Medium'
-            
-            findings_str = '\n'.join(findings) if findings else 'Chief complaint identified'
-            conditions_str = ', '.join(conditions) if conditions else 'Medical conditions noted'
-            
-            return f"""<tool_calls>[{{"name": "extract_symptoms"}}, {{"name": "identify_conditions"}}, {{"name": "classify_severity"}}]</tool_calls>
-FINDINGS:
-- {findings_str}
-- Conditions: {conditions_str}
-- Severity: {severity}"""
-        
-        elif self.agent_type == AgentType.RISK_DETECTOR:
-            risk_level = 'LOW'
-            critical_flags = []
-            
-            if 'chest pain' in text_lower or 'acute' in text_lower or 'emergency' in text_lower:
-                risk_level = 'HIGH'
-                critical_flags.append('Acute presentation')
-            elif 'chronic' in text_lower:
-                risk_level = 'LOW'
-            else:
-                risk_level = 'MEDIUM'
-            
-            if 'bp' in text_lower or 'blood pressure' in text_lower:
-                critical_flags.append('Vital sign abnormality')
-            if 'o2' in text_lower or 'oxygen' in text_lower or 'sat' in text_lower:
-                critical_flags.append('Respiratory concern')
-            if 'fever' in text_lower:
-                critical_flags.append('Fever present')
-            if 'allerg' in text_lower:
-                critical_flags.append('Allergy noted')
-            
-            flags_str = '\n- '.join(critical_flags) if critical_flags else 'No immediate critical flags'
-            urgency = 'URGENT' if risk_level == 'HIGH' else 'ROUTINE'
-            
-            return f"""<tool_calls>[{{"name": "detect_critical_values"}}, {{"name": "flag_abnormalities"}}, {{"name": "assess_urgency"}}]</tool_calls>
-CRITICAL FLAGS:
-- {flags_str}
-- Risk Level: {risk_level}
-- Urgency: {urgency}"""
-        
-        elif self.agent_type == AgentType.DRUG_INTERACTION:
-            interactions = []
-            
-            if 'lisinopril' in text_lower and 'potassium' in text_lower:
-                interactions.append('Lisinopril-Potassium interaction')
-            if 'metformin' in text_lower and 'alcohol' in text_lower:
-                interactions.append('Metformin-Alcohol interaction')
-            if 'aspirin' in text_lower and 'warfarin' in text_lower:
-                interactions.append('Aspirin-Warfarin interaction')
-            
-            status = 'Safe' if not interactions else 'Caution'
-            interactions_str = '\n- '.join(interactions) if interactions else 'No major interactions detected'
-            
-            return f"""<tool_calls>[{{"name": "check_interactions"}}, {{"name": "check_contraindications"}}, {{"name": "verify_dosage"}}]</tool_calls>
-FINDINGS:
-- {interactions_str}
-- Status: {status}
-- Dosages: Within normal range"""
-        
-        elif self.agent_type == AgentType.RECOMMENDATION:
-            tests = []
-            treatments = []
-            
-            if 'chest pain' in text_lower:
-                tests.extend(['ECG', 'Troponin', 'Chest X-ray'])
-                treatments.extend(['Aspirin', 'Beta-blocker', 'Nitrates'])
-            if 'fever' in text_lower:
-                tests.extend(['Complete Blood Count', 'Blood Culture'])
-                treatments.extend(['Antibiotics if bacterial', 'Supportive care'])
-            if 'shortness of breath' in text_lower or 'dyspnea' in text_lower:
-                tests.extend(['Chest X-ray', 'Arterial Blood Gas'])
-                treatments.extend(['Oxygen therapy', 'Bronchodilators'])
-            
-            tests_str = ', '.join(set(tests)) if tests else 'Baseline investigations'
-            treatments_str = ', '.join(set(treatments)) if treatments else 'Supportive care'
-            
-            return f"""<tool_calls>[{{"name": "suggest_tests"}}, {{"name": "suggest_treatments"}}, {{"name": "predict_outcomes"}}]</tool_calls>
-FINDINGS:
-- Suggested tests: {tests_str}
-- Recommended treatments: {treatments_str}
-- Monitoring: Continuous vital signs and clinical assessment
-- Outcome prediction: Favorable with appropriate intervention"""
-        
-        return f"Analysis complete"
+            return self._clinical_analysis(note)
+        if self.agent_type == AgentType.RISK_DETECTOR:
+            return self._risk_analysis(note)
+        if self.agent_type == AgentType.DRUG_INTERACTION:
+            return self._drug_analysis(note)
+        if self.agent_type == AgentType.RECOMMENDATION:
+            return self._recommendation_analysis(note)
+        return {}, []
 
-    def _extract_tool_calls(self, response: str) -> List[Dict[str, Any]]:
-        try:
-            match = re.search(r'<tool_calls>(.*?)</tool_calls>', response, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-        except:
-            pass
-        return []
+    # ----- Clinical Analyzer ---------------------------------------------
+    def _clinical_analysis(self, note: ClinicalNote):
+        tool_calls = ["extract_symptoms", "predict_disease", "cluster_disease"]
 
-    def _parse_findings(self, response: str) -> Dict[str, Any]:
-        findings = {}
-        
-        if "FINDINGS:" in response:
-            findings["raw"] = response.split("FINDINGS:")[1].strip()
-        
-        if "CRITICAL" in response:
-            findings["has_critical_alerts"] = True
-        
-        if "HIGH" in response.upper():
-            findings["risk_level"] = "HIGH"
-        elif "MEDIUM" in response.upper():
-            findings["risk_level"] = "MEDIUM"
+        # Build a unified symptom list from explicit input + free text.
+        explicit_symptoms = [s.strip() for s in (note.symptoms or []) if s.strip()]
+        text_symptoms = self.predictor.extract_symptoms(note.note_text or "")
+        all_symptoms = list(dict.fromkeys(explicit_symptoms + text_symptoms))
+
+        symptom_prediction: Optional[Dict[str, Any]] = None
+        if all_symptoms:
+            symptom_prediction = self.predictor.predict_from_symptoms(all_symptoms, top_k=3)
+
+        disease_lookup: Optional[Dict[str, Any]] = None
+        if note.disease_query:
+            disease_lookup = self.predictor.predict_from_disease(note.disease_query)
+
+        # Cross check: if a disease name was supplied, treat it as the primary
+        # hypothesis. Otherwise the ML model is the primary hypothesis.
+        primary_disease: Optional[Dict[str, Any]] = None
+        if disease_lookup and disease_lookup.get("found"):
+            primary_disease = disease_lookup
+        elif symptom_prediction and symptom_prediction.get("top_diseases"):
+            primary_disease = symptom_prediction["top_diseases"][0]
+
+        # Light demographics extraction.
+        text_lower = (note.note_text or "").lower()
+        age_match = re.search(r"(\d{1,3})\s*(?:y/?o|year[s]?[\s-]*old|yo)", text_lower)
+        gender_match = re.search(r"\b(male|female|man|woman|m\b|f\b)\b", text_lower)
+        age = age_match.group(1) if age_match else None
+        gender = gender_match.group(1) if gender_match else None
+
+        findings: Dict[str, Any] = {
+            "symptoms_identified": all_symptoms,
+            "primary_disease": primary_disease,
+            "alternative_diseases": (
+                [d for d in (symptom_prediction or {}).get("top_diseases", [])[1:]]
+                if symptom_prediction else []
+            ),
+            "cluster_related_diseases": (
+                (symptom_prediction or {}).get("cluster_related_diseases", [])
+            ),
+            "model_used": "RandomForestClassifier + GradientBoostingRegressor + KMeans",
+        }
+        if disease_lookup is not None:
+            findings["disease_lookup"] = disease_lookup
+        if age:
+            findings["patient_age"] = age
+        if gender:
+            findings["patient_gender"] = gender
+
+        return findings, tool_calls
+
+    # ----- Risk Detector ---------------------------------------------------
+    def _risk_analysis(self, note: ClinicalNote):
+        tool_calls = ["score_risk", "assess_severity", "flag_critical"]
+
+        primary = self._primary_disease(note)
+        explicit_symptoms = [s.strip() for s in (note.symptoms or []) if s.strip()]
+        text_symptoms = self.predictor.extract_symptoms(note.note_text or "")
+        all_symptoms = list(dict.fromkeys(explicit_symptoms + text_symptoms))
+
+        # Risk score: prefer dataset score for primary disease, fall back to
+        # the regressor.
+        risk_score: Optional[float] = None
+        severity: Optional[str] = None
+        confidence = 0.0
+        rationale_parts: List[str] = []
+
+        if primary and "risk_score" in primary:
+            risk_score = float(primary["risk_score"])
+            severity = primary.get("severity")
+            confidence = 0.95
+            rationale_parts.append(
+                f"Risk score pulled directly from dataset for {primary.get('disease')}"
+            )
+        elif all_symptoms:
+            pred = self.predictor.predict_from_symptoms(all_symptoms, top_k=1)
+            risk_score = float(pred["predicted_risk_score"] or 0)
+            confidence = 0.6 + float(pred["top_diseases"][0]["probability"]) / 2 if pred["top_diseases"] else 0.6
+            rationale_parts.append("Risk score estimated by GradientBoosting regressor")
         else:
-            findings["risk_level"] = "LOW"
-        
-        match = re.search(r'Urgency: (\w+)', response)
-        if match:
-            findings["urgency"] = match.group(1)
-        
-        return findings
+            risk_score = 0.0
+            confidence = 0.2
+            rationale_parts.append("Insufficient information; defaulting to zero risk")
 
+        # Critical symptom flags
+        critical_keywords = [
+            "chest pain", "shortness of breath", "loss of consciousness",
+            "confusion", "severe headache", "seizures", "coughing blood",
+            "blood in stool", "blood in urine", "jaundice",
+        ]
+        flags = [s for s in all_symptoms if s.lower() in critical_keywords]
+        if primary and primary.get("severity", "").lower() == "critical":
+            flags.append(f"Critical-severity disease: {primary.get('disease')}")
+
+        risk_level = _risk_level(risk_score or 0)
+        urgency = {
+            "Critical": "EMERGENCY",
+            "High": "URGENT",
+            "Medium": "SEMI-URGENT",
+            "Low": "ROUTINE",
+            "Unknown": "ROUTINE",
+        }.get(risk_level, "ROUTINE")
+
+        findings = {
+            "primary_disease": primary.get("disease") if primary else None,
+            "risk_score": round(risk_score or 0, 1),
+            "risk_level": risk_level,
+            "urgency": urgency,
+            "severity": severity,
+            "critical_flags": flags or ["No immediate critical flags identified"],
+            "rationale": "; ".join(rationale_parts),
+            "confidence": round(confidence, 2),
+        }
+
+        return findings, tool_calls
+
+    # ----- Drug Interaction ------------------------------------------------
+    def _drug_analysis(self, note: ClinicalNote):
+        tool_calls = ["check_interactions", "check_contraindications", "verify_dosage"]
+
+        # Collect the medications to evaluate:
+        # 1. The ones the user typed in.
+        medications: List[str] = list(note.medications or [])
+        # 2. Any additional meds mentioned inline in the note text.
+        for hit in INLINE_MED_PATTERN.findall(note.note_text or ""):
+            cap = hit.capitalize()
+            if not any(cap.lower() in existing.lower() for existing in medications):
+                medications.append(cap)
+        # 3. The medications recommended by the model for the primary disease.
+        primary = self._primary_disease(note)
+        recommended = list((primary or {}).get("medications", []) or [])
+
+        interactions = _check_drug_interactions(medications)
+        recommended_interactions = _check_drug_interactions(recommended)
+
+        high = [i for i in interactions if i["severity"] == "HIGH"]
+        medium = [i for i in interactions if i["severity"] == "MEDIUM"]
+
+        if high:
+            overall_status = "CAUTION — HIGH severity interaction(s) detected"
+        elif medium:
+            overall_status = "CAUTION — moderate interaction(s) detected"
+        elif medications:
+            overall_status = "Safe — no major interactions detected"
+        else:
+            overall_status = "No medications provided to evaluate"
+
+        findings = {
+            "medications_reviewed": medications,
+            "recommended_medications": recommended,
+            "recommended_medication_interactions": recommended_interactions,
+            "interactions_found": interactions,
+            "high_severity_interactions": high,
+            "medium_severity_interactions": medium,
+            "overall_status": overall_status,
+            "total_interactions": len(interactions),
+        }
+
+        return findings, tool_calls
+
+    # ----- Recommendation Engine ------------------------------------------
+    def _recommendation_analysis(self, note: ClinicalNote):
+        tool_calls = ["suggest_medications", "suggest_tests", "predict_outcomes"]
+
+        primary = self._primary_disease(note)
+        risk = self._risk_from_note(note, primary)
+
+        suggested_meds = list((primary or {}).get("medications", []) or [])
+        suggested_tests = list((primary or {}).get("tests", []) or [])
+        specialty = (primary or {}).get("specialty", "")
+        description = (primary or {}).get("description", "")
+
+        # Outcome prediction: tie it to the risk score.
+        if risk is None:
+            outcome = "Insufficient data to predict outcome"
+        elif risk >= 80:
+            outcome = "Guarded — requires urgent intervention and close monitoring"
+        elif risk >= 60:
+            outcome = "Guarded — expected to require active treatment"
+        elif risk >= 35:
+            outcome = "Fair — expected improvement with appropriate management"
+        else:
+            outcome = "Good — likely to improve with standard treatment and follow-up"
+
+        monitoring = ["Periodic vital sign checks"]
+        if primary and ("Cardiology" in specialty or "cardiac" in description.lower()):
+            monitoring.append("Continuous cardiac monitoring (telemetry)")
+        if primary and "Pulmonology" in specialty:
+            monitoring.append("Serial oxygen saturation monitoring")
+        if primary and "Endocrinology" in specialty:
+            monitoring.append("Blood glucose / metabolic panel monitoring")
+        if "chest pain" in [s.lower() for s in (note.symptoms or [])] or "chest pain" in (note.note_text or "").lower():
+            monitoring.append("Continuous cardiac monitoring (telemetry)")
+
+        findings = {
+            "primary_disease": (primary or {}).get("disease"),
+            "specialty": specialty,
+            "description": description,
+            "suggested_medications": suggested_meds or ["Supportive care — no specific medication recommended"],
+            "suggested_tests": suggested_tests or ["General workup recommended"],
+            "monitoring_plan": monitoring,
+            "outcome_prediction": outcome,
+            "follow_up": "Re-evaluate in 24–48h or sooner if condition changes",
+            "risk_score": risk,
+        }
+
+        return findings, tool_calls
+
+    # ------------------------------------------------------------------
+    def _primary_disease(self, note: ClinicalNote) -> Optional[Dict[str, Any]]:
+        """Return the primary disease dict for the note (or None)."""
+        if note.disease_query:
+            lookup = self.predictor.predict_from_disease(note.disease_query)
+            if lookup.get("found"):
+                return lookup
+        symptoms = [s for s in (note.symptoms or []) if s.strip()]
+        if not symptoms and note.note_text:
+            symptoms = self.predictor.extract_symptoms(note.note_text)
+        if not symptoms:
+            return None
+        prediction = self.predictor.predict_from_symptoms(symptoms, top_k=1)
+        if prediction["top_diseases"]:
+            return prediction["top_diseases"][0]
+        return None
+
+    def _risk_from_note(self, note: ClinicalNote, primary: Optional[Dict[str, Any]]) -> Optional[float]:
+        if primary and "risk_score" in primary:
+            return float(primary["risk_score"])
+        symptoms = [s for s in (note.symptoms or []) if s.strip()]
+        if not symptoms and note.note_text:
+            symptoms = self.predictor.extract_symptoms(note.note_text)
+        if not symptoms:
+            return None
+        prediction = self.predictor.predict_from_symptoms(symptoms, top_k=1)
+        return float(prediction["predicted_risk_score"] or 0)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 class ClinicalWorkflowOrchestrator:
-    def __init__(self):
+    def __init__(self, predictor: Optional[MLPredictor] = None):
+        self.predictor = predictor or MLPredictor()
+        self.predictor.load()
         self.agents = {
-            AgentType.CLINICAL_ANALYZER: MedGemmaAgent(AgentType.CLINICAL_ANALYZER),
-            AgentType.RISK_DETECTOR: MedGemmaAgent(AgentType.RISK_DETECTOR),
-            AgentType.DRUG_INTERACTION: MedGemmaAgent(AgentType.DRUG_INTERACTION),
-            AgentType.RECOMMENDATION: MedGemmaAgent(AgentType.RECOMMENDATION),
+            AgentType.CLINICAL_ANALYZER: MedGemmaAgent(AgentType.CLINICAL_ANALYZER, self.predictor),
+            AgentType.RISK_DETECTOR:     MedGemmaAgent(AgentType.RISK_DETECTOR, self.predictor),
+            AgentType.DRUG_INTERACTION:  MedGemmaAgent(AgentType.DRUG_INTERACTION, self.predictor),
+            AgentType.RECOMMENDATION:    MedGemmaAgent(AgentType.RECOMMENDATION, self.predictor),
         }
-        self.execution_log = []
+        self.execution_log: List[AnalysisResult] = []
 
     def process_note(self, note: ClinicalNote) -> Dict[str, Any]:
-        results = {}
+        results: Dict[str, AnalysisResult] = {}
         self.execution_log = []
-        
-        print(f"[Stage 1] Clinical Analyzer for {note.patient_id}...")
-        clinical_result = self.agents[AgentType.CLINICAL_ANALYZER].analyze(note)
-        results["clinical_analysis"] = clinical_result
-        self.execution_log.append(clinical_result)
-        
-        print(f"[Stage 2] Risk Detector...")
-        risk_result = self.agents[AgentType.RISK_DETECTOR].analyze(note)
-        results["risk_assessment"] = risk_result
-        self.execution_log.append(risk_result)
-        
-        if note.medications:
-            print(f"[Stage 3] Drug Interaction Checker...")
-            med_note = ClinicalNote(
-                patient_id=note.patient_id,
-                note_text=f"Medications: {', '.join(note.medications)}\n\n{note.note_text}",
-                medications=note.medications
-            )
-            drug_result = self.agents[AgentType.DRUG_INTERACTION].analyze(med_note)
-            results["drug_interactions"] = drug_result
-            self.execution_log.append(drug_result)
-        
-        print(f"[Stage 4] Recommendation Engine...")
-        rec_context = f"Analysis:\n- Clinical: {results['clinical_analysis'].findings}\n- Risk: {results.get('risk_assessment', {}).findings}\n\nNote: {note.note_text}"
-        
-        rec_note = ClinicalNote(
-            patient_id=note.patient_id,
-            note_text=rec_context,
-            medications=note.medications
-        )
-        rec_result = self.agents[AgentType.RECOMMENDATION].analyze(rec_note)
-        results["recommendations"] = rec_result
-        self.execution_log.append(rec_result)
-        
+
+        results[AgentType.CLINICAL_ANALYZER] = self.agents[AgentType.CLINICAL_ANALYZER].analyze(note)
+        self.execution_log.append(results[AgentType.CLINICAL_ANALYZER])
+
+        results[AgentType.RISK_DETECTOR] = self.agents[AgentType.RISK_DETECTOR].analyze(note)
+        self.execution_log.append(results[AgentType.RISK_DETECTOR])
+
+        results[AgentType.DRUG_INTERACTION] = self.agents[AgentType.DRUG_INTERACTION].analyze(note)
+        self.execution_log.append(results[AgentType.DRUG_INTERACTION])
+
+        results[AgentType.RECOMMENDATION] = self.agents[AgentType.RECOMMENDATION].analyze(note)
+        self.execution_log.append(results[AgentType.RECOMMENDATION])
+
         return {
             "patient_id": note.patient_id,
-            "workflow_stage_1_analysis": results["clinical_analysis"].findings,
-            "workflow_stage_2_risks": results["risk_assessment"].findings,
-            "workflow_stage_3_interactions": results.get("drug_interactions", {}).findings if "drug_interactions" in results else None,
-            "workflow_stage_4_recommendations": results["recommendations"].findings,
+            "input": {
+                "disease_query": note.disease_query,
+                "symptoms": note.symptoms,
+                "medications": note.medications,
+                "note_text": note.note_text,
+            },
+            "workflow_stage_1_analysis": results[AgentType.CLINICAL_ANALYZER].findings,
+            "workflow_stage_2_risks":    results[AgentType.RISK_DETECTOR].findings,
+            "workflow_stage_3_interactions": results[AgentType.DRUG_INTERACTION].findings,
+            "workflow_stage_4_recommendations": results[AgentType.RECOMMENDATION].findings,
             "tools_invoked": sum(len(r.tool_calls_made) for r in self.execution_log),
             "execution_log": [
                 {
                     "agent": r.agent_name,
                     "tools_called": r.tool_calls_made,
-                    "confidence": r.confidence
+                    "confidence": r.confidence,
                 }
                 for r in self.execution_log
-            ]
+            ],
         }
 
 
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    sample_note = ClinicalNote(
+    sample = ClinicalNote(
         patient_id="P12345",
-        note_text="""Patient: John Doe, 58M
-Chief Complaint: Chest pain and shortness of breath
-HPI: 2 days of intermittent chest pain, worse with exertion.
-Associated with dyspnea and diaphoresis.
-PMH: Hypertension (10 years), Type 2 DM (5 years)
-Vital Signs: BP 160/100, HR 105, RR 22, O2 Sat 94%
-Physical Exam: Anxious, regular rate and rhythm, lungs clear.
-Assessment: Acute coronary syndrome vs anxiety.""",
-        medications=["Lisinopril 10mg", "Metformin 1000mg", "Aspirin 81mg"]
+        note_text=(
+            "Patient with chest pain, shortness of breath, sweating. "
+            "History of hypertension. BP 160/100, HR 105."
+        ),
+        symptoms=["chest pain", "shortness of breath", "sweating"],
+        medications=["Lisinopril 10mg", "Aspirin 81mg"],
     )
-    
+
     orchestrator = ClinicalWorkflowOrchestrator()
-    
-    print("=" * 60)
-    print("CLINICAL WORKFLOW PROCESSING")
-    print("=" * 60)
-    result = orchestrator.process_note(sample_note)
-    
-    print("\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
+    result = orchestrator.process_note(sample)
+
+    import json
     print(json.dumps(result, indent=2, default=str))

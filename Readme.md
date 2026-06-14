@@ -144,10 +144,32 @@ cd frontend && npm install && cd ..
 ```
 
 ### 4. Run Backend (Terminal 1)
-```bash
-python backend/app.py
+
+Make sure your shell is in the project root (`Clinical-Multi-Agent-System/`).
+The commands below assume the venv is at `../venv` next to the project.
+
+**Windows (PowerShell)**
+```powershell
+# From the Clinical-Multi-Agent-System folder
+..\venv\Scripts\python.exe backend\app.py
 # Runs at http://localhost:5000
 ```
+
+**Windows (cmd)**
+```cmd
+..\venv\Scripts\python.exe backend\app.py
+```
+
+**macOS / Linux**
+```bash
+../venv/bin/python backend/app.py
+```
+
+> If you have activated the venv (`venv\Scripts\activate`) you can just run
+> `python backend/app.py` from the project root. Do **not** `cd` into
+> `backend/` first – the app is configured to be launched as
+> `backend.app` from the project root so that its `backend.*` imports
+> resolve correctly.
 
 ### 5. Run Frontend (Terminal 2)
 ```bash
